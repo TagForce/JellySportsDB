@@ -195,4 +195,21 @@ class TheSportsDBClient:
             req = Request(url, headers=self.headers)
             with urlopen(req, context=self.ssl_ctx) as resp:
                 return resp.read()
-        except Exception
+        except Exception as e:
+            log.LogExcept(f"Artwork download failed: {url}", e, pluginid)
+            return None
+
+    def test_event_file(self, filename: str) -> str:
+        """Check for .tsdbevt sidecar file with event ID."""
+        base, _ = os.path.splitext(filename)
+        evtfile = base + '.tsdbevt'
+        if not os.path.isfile(evtfile):
+            return ''
+        try:
+            with open(evtfile, 'r', encoding='utf-8') as f:
+                event_id = f.readline().strip()
+            if re.match(r'^[0-9]{3,10}$', event_id):
+                return event_id
+        except Exception:
+            pass
+        return ''
