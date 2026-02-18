@@ -1,145 +1,110 @@
-'''
-Jellyfin Sports Monitor
-Monitors Jellyfin library folders retrieved via the API and processes sports files.
-'''
+#!/usr/bin/env python3
+"""
+JellySportsDB – Modern object-oriented filesystem watcher + metadata agent
+"""
 
 import sys
 import time
-import os
+from pathlib import Path
 from importlib import reload
 
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent, FileMovedEvent
+from watchdog.events import FileSystemEventHandler
 
-# Existing helpers (unchanged)
-import helpers.process as process
-import helpers.jellyapi as jellyapi
-import helpers.plexlog as log
+from helpers.config import AppConfig
+from helpers.plexlog import log, setup as setup_logging, LL_INFO
+from helpers.jellyfin_client import JellyfinClient
+from helpers.sportsdb_client import TheSportsDBClient
+from helpers.process import process_file, set_clients  # We'll add set_clients
 
+class SportsVideoHandler(FileSystemEventHandler):
+    VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts", ".mpg", ".webm"}
 
-class SportsFileHandler(FileSystemEventHandler):
-    """Handles filesystem events for video files only."""
-
-    VIDEO_EXTS = {
-        'webm', 'mkv', 'flv', 'vob', 'ogv', 'ogg', 'mov', 'avi', 'qt', 'wmv',
-        'asf', 'amv', 'mp4', 'm4p', 'm4v', 'mpg', 'mpeg', 'mpe', 'mpv', '3gp',
-        '3g2', 'mxf', 'nsv', 'f4v', 'mod', 'rm', 'rmvb', 'ts', 'm2ts'
-    }
-
-    def __init__(self, base_path: str):
-        super().__init__()
-        self.base_path = os.path.abspath(base_path)
+    def __init__(self, root_path: Path, processor):
+        self.root = root_path.resolve()
+        self.processor = processor
 
     def on_created(self, event):
-        if not event.is_directory and self._is_video(event.src_path):
-            self._process_file(event.src_path, "created")
+        if event.is_directory:
+            return
+        if Path(event.src_path).suffix.lower() in self.VIDEO_EXTENSIONS:
+            self._handle_file(event.src_path, "created")
 
     def on_modified(self, event):
-        if not event.is_directory and self._is_video(event.src_path):
-            self._process_file(event.src_path, "modified")
+        if event.is_directory:
+            return
+        if Path(event.src_path).suffix.lower() in self.VIDEO_EXTENSIONS:
+            self._handle_file(event.src_path, "modified")
 
     def on_moved(self, event):
-        # If a file is moved INTO a watched folder we treat it as created
-        if not event.is_directory and self._is_video(event.dest_path):
-            self._process_file(event.dest_path, "moved")
+        if event.is_directory:
+            return
+        if Path(event.dest_path).suffix.lower() in self.VIDEO_EXTENSIONS:
+            self._handle_file(event.dest_path, "moved →")
 
-    def _is_video(self, filepath: str) -> bool:
-        ext = os.path.splitext(filepath)[1].lstrip('.').lower()
-        return ext in self.VIDEO_EXTS
-
-    def _process_file(self, filepath: str, event_type: str):
+    def _handle_file(self, filepath: str, action: str):
+        path = Path(filepath)
         try:
-            # Calculate depth relative to the library root (exactly what the old code expected)
-            dirpath = os.path.dirname(filepath)
-            rel = os.path.relpath(dirpath, self.base_path)
-            depth = 0 if rel == '.' else len(rel.split(os.sep))
-
-            log.Log(f"[{event_type.upper()}] Processing {filepath} (depth={depth})", "MONITOR")
-            result = process.ProcessFile(filepath, depth)
-            log.Log(f"Process result: {result}", "MONITOR", log.LL_INFO)
-
+            rel = path.parent.relative_to(self.root)
+            depth = 0 if str(rel) == "." else len(rel.parts)
+            log(f"[{action.upper()}] {filepath}  (depth={depth})", "FS", LL_INFO)
+            process_file(str(path), depth)
         except Exception as e:
-            log.LogExcept(f"Failed to process {filepath}", e, "MONITOR")
+            log(f"Processing failed for {filepath}: {e}", "FS", level=40)
 
 
-class JellyfinSportsMonitor:
-    """Main monitor class - fetches library paths from Jellyfin and starts watchers."""
+class JellySportsDBApp:
+    def __init__(self):
+        self.config = AppConfig()
+        setup_logging(level=self.config.log_level)
 
-    def __init__(self,
-                 jellyfin_url: str = "http://192.168.2.20:8096/",
-                 token: str = "55321e3ed64c4f02b8c82a3283041003"):
-        self.jellyfin_url = jellyfin_url.rstrip('/')
-        self.token = token
+        log("JellySportsDB starting...", "MAIN")
 
-        # Configure the existing jellyapi module (it uses module-level globals)
-        jellyapi.baseurl = self.jellyfin_url
-        jellyapi.headers["Authorization"] = f'MediaBrowser Token="{self.token}"'
+        self.jellyfin = JellyfinClient(self.config.jellyfin_url, self.config.jellyfin_token)
+        self.sportsdb = TheSportsDBClient(self.config.sportsdb_apikey_file)
 
-        self.library_paths = self._fetch_library_paths()
+        # Inject clients into process module
+        set_clients(self.jellyfin, self.sportsdb)
+
+        self.library_paths = self._get_library_paths()
         self.observer = Observer()
-        self.handlers = []
 
-    def _fetch_library_paths(self) -> list[str]:
-        """Retrieve every physical folder from Jellyfin VirtualFolders."""
-        paths = []
+    def _get_library_paths(self):
         try:
-            vfolders = jellyapi.fetch_api("Library/VirtualFolders")
-            for vf in vfolders:
-                for loc in vf.get("Locations", []):
-                    abspath = os.path.abspath(loc)
-                    if os.path.isdir(abspath):
-                        paths.append(abspath)
-
-            # Fallback to MediaFolders if VirtualFolders returned nothing
-            if not paths:
-                media = jellyapi.fetch_api("Library/MediaFolders")
-                for item in media.get("Items", []):
-                    # MediaFolders don't always expose paths, so we skip them
-                    pass
-
+            vf_data = self.jellyfin._request("GET", "Library/VirtualFolders")
+            paths = []
+            for folder in vf_data if isinstance(vf_data, list) else vf_data.get("Items", []):
+                for loc in folder.get("Locations", []):
+                    p = Path(loc)
+                    if p.is_dir():
+                        paths.append(p)
+            unique = {p.resolve() for p in paths}
+            return sorted(unique)
         except Exception as e:
-            log.LogExcept("Could not fetch Jellyfin libraries – falling back to current directory", e, "MONITOR")
-            paths = ["."]
+            log(f"Could not fetch libraries: {e} → using current directory", "MAIN", 40)
+            return [Path(".")]
 
-        unique_paths = sorted(set(paths))
-        log.Log(f"Found {len(unique_paths)} library path(s) to monitor", "MONITOR")
-        for p in unique_paths:
-            log.Log(f"   → {p}", "MONITOR", log.LL_DEBUG)
-
-        return unique_paths
-
-    def start(self):
-        """Schedule a handler for every library path and start the observer."""
+    def run(self):
         for path in self.library_paths:
-            handler = SportsFileHandler(base_path=path)
-            self.observer.schedule(handler, path, recursive=True)
-            self.handlers.append(handler)
-            log.Log(f"Started monitoring: {path}", "MONITOR")
+            handler = SportsVideoHandler(path, self)
+            self.observer.schedule(handler, str(path), recursive=True)
+            log(f"Watching → {path}", "MAIN")
 
         self.observer.start()
-        log.Log("Jellyfin Sports Monitor is now running...", "MONITOR")
+        log("Monitoring active. Press Ctrl+C to stop.", "MAIN")
 
         try:
-            while self.observer.is_alive():
-                self.observer.join(1)
+            while True:
+                time.sleep(1)
         except KeyboardInterrupt:
-            log.Log("Received keyboard interrupt – shutting down", "MONITOR")
+            log("Shutting down...", "MAIN")
         finally:
             self.observer.stop()
             self.observer.join()
-            log.Log("Observer stopped", "MONITOR")
+            log("Stopped.", "MAIN")
 
 
 if __name__ == "__main__":
     reload(sys)
-    # sys.setdefaultencoding('utf-8')   # Python 3 no longer needs this
-
-    # plexlog already does its own file logging on import
-    log.setup()
-
-    # Optional: pass URL / token via command line if you want
-    url = sys.argv[1] if len(sys.argv) > 1 else "http://192.168.2.20:8096/"
-    token = sys.argv[2] if len(sys.argv) > 2 else "55321e3ed64c4f02b8c82a3283041003"
-
-    monitor = JellyfinSportsMonitor(jellyfin_url=url, token=token)
-    monitor.start()
+    app = JellySportsDBApp()
+    app.run()

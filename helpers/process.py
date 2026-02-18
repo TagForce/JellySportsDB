@@ -1,274 +1,246 @@
 '''
-Created on 21 mei 2025
-
-@author: Raymond
+helpers/process.py
+Object-oriented / client-injected version – 2026 refactor
 '''
-import os.path, unicodedata
-import nameregex as nameregex
-import kobimeta
-import plexlog as log
-import sportsdb as tsdb
-import jellyapi as api
 
+import os
+import unicodedata
+from pathlib import Path
+
+from . import nameregex
+from . import kobimeta
+from . import plexlog as log
+from . import fuzzy
+from .jellyfin_client import JellyfinClient
+from .sportsdb_client import TheSportsDBClient
 
 pluginid = "PROCESSOR"
 
-def ProcessFile(file, depth):
-    
-    # Immediately refresh Jellyfin as well.
-    #log.Log("Refreshing Jellyfin Libraries", pluginid)
-    #api.push_api("Library/Refresh")
-    
-    log.Log("Working on file | {0} |".format(file), pluginid)
+# Global references – set by jellysportsdb.py via set_clients()
+_jellyfin_client: JellyfinClient = None
+_sportsdb_client: TheSportsDBClient = None
+
+
+def set_clients(jellyfin: JellyfinClient, sportsdb: TheSportsDBClient):
+    """Called once at startup by the main application."""
+    global _jellyfin_client, _sportsdb_client
+    _jellyfin_client = jellyfin
+    _sportsdb_client = sportsdb
+
+
+def process_file(file: str, depth: int):
+    """
+    Main entry point for processing one sports video file.
+    Called from filesystem watcher.
+    """
+    if not _jellyfin_client or not _sportsdb_client:
+        log.Log("Clients not initialized – cannot process file", pluginid, log.LL_ERROR)
+        return {'message': 'clients not ready'}
+
+    log.Log(f"Working on file | {file} | (depth={depth})", pluginid)
+
     diskfile = {}
-    
-    # 'entity' is the part of the episode that holds the file system and general file information. It has no episode info
     diskfile['entity'] = {}
     diskfile['entity']['path'] = os.path.dirname(file)
     diskfile['entity']['filename'] = os.path.basename(file)
     diskfile['entity']['name'], diskfile['entity']['ext'] = os.path.splitext(diskfile['entity']['filename'])
-    diskfile['entity']['cleanname'] = nameregex.cleanfilenames(unicodedata.normalize('NFC', unicode(diskfile['entity']['name'])))
-    
-    # 'episode' holds the episode information that can be derived from the file name.
-    # It can be used to search TSDB for more elaborate information, or used on its own.
+    diskfile['entity']['cleanname'] = nameregex.cleanfilenames(
+        unicodedata.normalize('NFC', diskfile['entity']['name'])
+    )
+
+    # Parse episode info from filename
     diskfile['episode'] = nameregex.get_episode(diskfile['entity']['cleanname'])
-    if diskfile['episode']['retype'] != None:
-        diskfile['session'] = nameregex.get_session(diskfile['episode'], diskfile['entity']['cleanname'])
+
+    if diskfile['episode'].get('retype'):
+        session_info = nameregex.get_session(diskfile['episode'], diskfile['entity']['cleanname'])
+        diskfile['episode']['session'] = session_info.get('sessionname', '')
     else:
-        diskfile['session'] = {}
-    
-    # 'kobimeta' holds the information that is derived from Kobi (formerly xbmc) Metadata .nfo files.
-    # It is assumed to be purposefully added, so it takes preference over any other derived information.
-    
+        diskfile['episode']['session'] = ''
+
+    # Kobi/XBMC-style .nfo metadata (preferred if present)
     diskfile['kobimeta'] = kobimeta.get_metadata(file)
-    
+
+    # Build display names / numbers – preference: kobi > filename parsing
     showname = ''
     episodename = ''
     episodenr = 0
     season = 0
-    year = diskfile['episode']['year']
-    
-    if 'show' in diskfile['episode'].keys():
+    year = diskfile['episode'].get('year', '')
+
+    if 'show' in diskfile['episode']:
         showname = diskfile['episode']['show']
-    if 'season' in diskfile['episode'].keys():
-        if diskfile['episode']['week'] != 9999:
-            if not diskfile['episode']['preseason']:
-                season = diskfile['episode']['week']
-            showname = showname + ' (' + str(diskfile['episode']['season']) + ')'
+
+    if 'season' in diskfile['episode']:
+        if diskfile['episode'].get('week', 9999) != 9999 and not diskfile['episode'].get('preseason'):
+            season = diskfile['episode']['week']
+            showname = f"{showname} ({diskfile['episode']['season']})"
         else:
             season = diskfile['episode']['season']
-            showname = showname + ' (' + str(diskfile['episode']['season']) + ')'
-    if 'event' in diskfile['episode'].keys():
+            showname = f"{showname} ({diskfile['episode']['season']})"
+
+    if 'event' in diskfile['episode']:
         episodename = diskfile['episode']['event']
-        eventname = episodename
-    if 'episodenr' in diskfile['episode'].keys():
+
+    if 'episodenr' in diskfile['episode']:
         episodenr = diskfile['episode']['episodenr']
-    if 'sessionname' in diskfile['session'].keys():
-        episodename = diskfile['session']['eventname'] + ' - ' + diskfile['session']['sessionname']
-        if diskfile['episode']['week'] != 0:
-            episodename = str(diskfile['episode']['week']) + ': ' + episodename
-        if diskfile['episode']['preseason']:
-            episodename = 'Preseason ' + episodename
-        eventname = diskfile['session']['eventname']
-        diskfile['episode']['event'] = eventname
-    if 'episodenr' in diskfile['session'].keys():
+
+    # Session / event refinement
+    if 'sessionname' in diskfile.get('session', {}):
+        event_part = diskfile['session'].get('eventname', '')
+        session_part = diskfile['session']['sessionname']
+        episodename = f"{event_part} - {session_part}"
+        if diskfile['episode'].get('week', 0):
+            episodename = f"{diskfile['episode']['week']}: {episodenename}"
+        if diskfile['episode'].get('preseason'):
+            episodename = f"Preseason {episodenename}"
+        diskfile['episode']['event'] = event_part
+
+    if 'episodenr' in diskfile.get('session', {}):
         episodenr = diskfile['session']['episodenr']
-    if 'show' in diskfile['kobimeta'].keys():
-        if diskfile['kobimeta']['show'] != '':
-            showname = diskfile['kobimeta']['show']
-    if 'season' in diskfile['kobimeta'].keys():
+
+    # Kobi override
+    if 'show' in diskfile['kobimeta'] and diskfile['kobimeta']['show']:
+        showname = diskfile['kobimeta']['show']
+    if 'season' in diskfile['kobimeta']:
         season = diskfile['kobimeta']['season']
-    if 'episode' in diskfile['kobimeta'].keys():
+    if 'episode' in diskfile['kobimeta']:
         episodenr = diskfile['kobimeta']['episode']
-    if 'title' in diskfile['kobimeta'].keys():
+    if 'title' in diskfile['kobimeta']:
         episodename = diskfile['kobimeta']['title']
-    
+
+    # TheSportsDB lookup
     diskfile['tsdb'] = {}
-    tsdbloaded = False
-    #if (len(diskfile['kobimeta']) == 0): # If there is kobimetadata, we trust it has all the info.
-    if True:
-        # If there is a showname look it up on the SportsDB, if there's not, skip it.
-        log.Log("Looking up event on The SportsDB", pluginid, log.LL_INFO)
-        diskfile['tsdb'] = {}
-        diskfile['tsdb']['league'], diskfile['tsdb']['event'] = tsdb.get_episode(file, tsdb.search_league(showname), diskfile['episode'])
-        log.Log("Finished lookup. Parsing results", pluginid, log.LL_INFO)
-        log.Log("diskfile contents: {0}".format(diskfile['tsdb']['event']), pluginid, log.LL_DEBUG)
-        if 'strLeague' in diskfile['tsdb']['event'].keys():
-            if diskfile['tsdb']['event']['strLeague'] != '':
-                log.Log("TSDB league: {0}".format(diskfile['tsdb']['event']['strLeague']), pluginid, log.LL_INFO)
-                showname = '{0} ({1})'.format(diskfile['tsdb']['event']['strLeague'], diskfile['tsdb']['event']['strSeason'])
-            if diskfile['tsdb']['event']['strEvent'] != '':
-                log.Log("TSDB event : {0}".format(diskfile['tsdb']['event']['strEvent']), pluginid, log.LL_INFO)
-                if nameregex.hasSession(diskfile['tsdb']['event']['strEvent']):
-                    diskfile['tsdb']['event']['strEvent'] = nameregex.removeSession(diskfile['tsdb']['event']['strEvent'])
-                episodename = diskfile['tsdb']['event']['strEvent'] + ' - ' + diskfile['session']['sessionname']
-            
-            # Event artwork
-            posterfile = os.path.join(diskfile['entity']['path'], 'season{:02d}'.format(season) + '.jpg')
-            bannerfile = os.path.join(diskfile['entity']['path'], 'season{:02d}'.format(season) + '-banner.jpg')
-            squarefile = os.path.join(diskfile['entity']['path'], 'season{:02d}'.format(season) + '-square.jpg')
-            thumbfile  = os.path.join(diskfile['entity']['path'], diskfile['entity']['name'] + '.jpg')
-            
-            # Season artwork
-            dirname, filename = os.path.split(file)
-            if depth == 2:
-                # We're assuming to be in a season folder, so the show.jpg file should be one up.
-                sdir, tail = os.path.split(dirname)
-                showjpg = os.path.join(sdir, "show.jpg")
-                if os.path.exists(showjpg):
-                    sportfile = showjpg
-                elif os.path.exists(os.path.join(dirname, "show.jpg")):
-                    showjpg = os.path.join(dirname, "show.jpg")
-                    sportfile = showjpg
-                else:
-                    sportfile = showjpg
+    tsdb_loaded = False
+
+    if showname:
+        log.Log(f"Looking up '{showname}' on TheSportsDB", pluginid, log.LL_INFO)
+        league_info, event_info = _sportsdb_client.get_episode(
+            file,
+            _sportsdb_client.search_league(showname),
+            diskfile['episode']
+        )
+        diskfile['tsdb']['league'] = league_info
+        diskfile['tsdb']['event'] = event_info
+
+        if diskfile['tsdb']['event'] and 'strEvent' in diskfile['tsdb']['event']:
+            log.Log("Found TSDB event data", pluginid, log.LL_DEBUG)
+            tsdb_loaded = True
+
+            # Enhance title with round / venue
+            if season == 0:
+                diskfile['tsdb']['event']['strEvent'] = f"Non-Championship : {diskfile['tsdb']['event']['strEvent']}"
+            elif 'strVenue' in diskfile['tsdb']['event'] and diskfile['tsdb']['event']['strVenue'] != 'Unknown':
+                diskfile['tsdb']['event']['strEvent'] = (
+                    f"{str(season).zfill(2)} : {diskfile['tsdb']['event']['strEvent']} @ {diskfile['tsdb']['event']['strVenue']}"
+                )
             else:
-                sportfile = os.path.join(dirname, "show.jpg")
-            
-            # Fetch information for NFO files.
-            diskfile['nfo'] = {}
-            if diskfile['tsdb'] != {}:
-                # Get the league poster
-                diskfile['nfo']['sport'] = {}
-                diskfile['nfo']['sport']['poster'] = sportfile
-                if not (os.path.isfile(sportfile)):
-                    if (diskfile['tsdb']['league']['strPoster'] != ''):
-                        try:
-                            with open(sportfile, 'wb') as fp:
-                                fp.write(tsdb.fetch_tsdb_art(diskfile['tsdb']['league']['strPoster']))
-                        except Exception as e:
-                            log.LogExcept('Failed to write season poster file', e, pluginid)
-                            pass
-                
-                # Get the event artwork
-                diskfile['nfo']['season'] = {}
-                diskfile['nfo']['season']['poster'] = posterfile
-                if not (os.path.isfile(posterfile)):
-                    if (diskfile['tsdb']['event']['strPoster'] != ''):
-                        try:
-                            with open(posterfile, 'wb') as fp:
-                                fp.write(tsdb.fetch_tsdb_art(diskfile['tsdb']['event']['strPoster']))
-                        except Exception as e:
-                            log.LogExcept('Failed to write season poster file', e, pluginid)
-                            pass
-                diskfile['nfo']['season']['banner'] = bannerfile
-                if not (os.path.isfile(bannerfile)):
-                    if (diskfile['tsdb']['event']['strBanner'] != ''):
-                        try:
-                            with open(bannerfile, 'wb') as fp:
-                                fp.write(tsdb.fetch_tsdb_art(diskfile['tsdb']['event']['strBanner']))
-                        except Exception as e:
-                            log.LogExcept('Failed to write banner file', e, pluginid)
-                            pass               
-                diskfile['nfo']['season']['square'] = squarefile
-                if not (os.path.isfile(squarefile)):
-                    if (diskfile['tsdb']['event']['strSquare'] != ''):
-                        try:
-                            with open(squarefile, 'wb') as fp:
-                                fp.write(tsdb.fetch_tsdb_art(diskfile['tsdb']['event']['strSquare']))
-                        except Exception as e:
-                            log.LogExcept('Failed to write square file', e, pluginid)
-                            pass
-                diskfile['nfo']['season']['thumb'] = thumbfile
-                if not (os.path.isfile(thumbfile)):
-                    if (diskfile['tsdb']['event']['strThumb'] != ''):
-                        try:
-                            with open(thumbfile, 'wb') as fp:
-                                fp.write(tsdb.fetch_tsdb_art(diskfile['tsdb']['event']['strThumb']))
-                        except Exception as e:
-                            log.LogExcept('Failed to write thumb file', e, pluginid)
-                            pass
-                
-                    log.Log("Creating .NFO file", pluginid, log.LL_INFO)
-                if not 'strVenue' in diskfile['tsdb']['event'].keys():
-                    diskfile['tsdb']['event']['strVenue'] = 'Unknown'
-                    
-                if season == 0:
-                    diskfile['tsdb']['event']['strEvent'] = "Non-Championship"
-                elif diskfile['tsdb']['event']['strVenue'] == 'Unknown':
-                    diskfile['tsdb']['event']['strEvent'] = str(season).zfill(2) + " : " + diskfile['tsdb']['event']['strEvent']
-                else:
-                    diskfile['tsdb']['event']['strEvent'] = str(season).zfill(2) + " : " + diskfile['tsdb']['event']['strEvent'] + " @ " + diskfile['tsdb']['event']['strVenue']
-                kobimeta.makenfo(file, depth, diskfile['tsdb'], diskfile['nfo'], showname, episodename, episodenr, season) 
-                tsdbloaded = True
-                seasonname = diskfile['tsdb']['event']['strEvent']
-                                        
+                diskfile['tsdb']['event']['strEvent'] = (
+                    f"{str(season).zfill(2)} : {diskfile['tsdb']['event']['strEvent']}"
+                )
+
+            seasonname = diskfile['tsdb']['event']['strEvent']
+
+            # Write .nfo
+            kobimeta.makenfo(
+                file,
+                depth,
+                diskfile['tsdb'],
+                diskfile.get('nfo', {}),
+                showname,
+                episodename,
+                episodenr,
+                season
+            )
         else:
-            log.Log('diskfile does not contain tsdb data', pluginid, log.LL_DEBUG)
-    
-    if not tsdbloaded:
-        # We do have some information that we can add to an NFO file, just not from TSDB.
-        posterfile = os.path.join(diskfile['entity']['path'], 'season{:02d}'.format(season) + '.jpg')
-        bannerfile = os.path.join(diskfile['entity']['path'], 'season{:02d}'.format(season) + '-banner.jpg')
-        squarefile = os.path.join(diskfile['entity']['path'], 'season{:02d}'.format(season) + '-square.jpg')
-        thumbfile  = os.path.join(diskfile['entity']['path'], diskfile['entity']['name'] + '.jpg')
-        dirname, filename = os.path.split(file)
+            log.Log("No usable TSDB event found", pluginid, log.LL_DEBUG)
+
+    # Fallback: no TSDB data → still create basic .nfo from parsed info
+    if not tsdb_loaded:
+        log.Log("Using fallback metadata creation (no TSDB)", pluginid, log.LL_INFO)
+
+        posterfile   = os.path.join(diskfile['entity']['path'], f"season{season:02d}.jpg")
+        bannerfile   = os.path.join(diskfile['entity']['path'], f"season{season:02d}-banner.jpg")
+        squarefile   = os.path.join(diskfile['entity']['path'], f"season{season:02d}-square.jpg")
+        thumbfile    = os.path.join(diskfile['entity']['path'], f"{diskfile['entity']['name']}.jpg")
+
+        dirname = diskfile['entity']['path']
+        showjpg = os.path.join(dirname, "show.jpg")
+
+        # Try to find show poster one level up if in season folder
         if depth == 2:
-            # We're assuming to be in a season folder, so the show.jpg file should be one up.
-            sdir, tail = os.path.split(dirname)
-            showjpg = os.path.join(sdir, "show.jpg")
-            if os.path.exists(showjpg):
-                sportfile = showjpg
-            elif os.path.exists(os.path.join(dirname, "show.jpg")):
-                showjpg = os.path.join(dirname, "show.jpg")
-                sportfile = showjpg
-            else:
-                sportfile = showjpg
-        else:
-            sportfile = os.path.join(dirname, "show.jpg")
-        
-        diskfile['nfo'] = {'season':{}, 'sport': {}}
-        
-        # We only really need the poster for the series, and the poster and thumb for the event.
-        if (os.path.isfile(thumbfile)):
-            diskfile['nfo']['season']['thumb'] = thumbfile
-        else: 
-            diskfile['nfo']['season']['thumb'] = ''
-        if (os.path.isfile(posterfile)):
-            diskfile['nfo']['season']['poster'] = posterfile
-        else: 
-            diskfile['nfo']['season']['poster'] = ''
-        if (os.path.isfile(sportfile)):
-            diskfile['nfo']['sport']['poster'] = sportfile
-        else: 
-            diskfile['nfo']['sport']['poster'] = ''
-        
-        nfoinfo = {'event': {}, 'league': {}}
-        nfoinfo['event']['strEvent'] = diskfile['episode']['event']
-        if not 'strVenue' in nfoinfo['event'].keys():
-            nfoinfo['event']['strVenue'] = 'Unknown'
-            
+            parent_dir = os.path.dirname(dirname)
+            if os.path.exists(os.path.join(parent_dir, "show.jpg")):
+                showjpg = os.path.join(parent_dir, "show.jpg")
+
+        nfo_art = {
+            'season': {
+                'thumb': thumbfile if os.path.isfile(thumbfile) else '',
+                'poster': posterfile if os.path.isfile(posterfile) else ''
+            },
+            'sport': {
+                'poster': showjpg if os.path.exists(showjpg) else ''
+            }
+        }
+
+        nfo_event = {'event': {}, 'league': {}}
+        nfo_event['event']['strEvent'] = diskfile['episode'].get('event', 'Unknown Event')
+        nfo_event['event']['strVenue'] = 'Unknown'  # can be improved later
+
         if season == 0:
-            nfoinfo['event']['strEvent'] = "Non-Championship"
-        elif nfoinfo['event']['strVenue'] == 'Unknown':
-            nfoinfo['event']['strEvent'] = str(season).zfill(2) + " : " + nfoinfo['event']['strEvent']
+            title = "Non-Championship"
+        elif nfo_event['event']['strVenue'] == 'Unknown':
+            title = f"{season:02d} : {nfo_event['event']['strEvent']}"
         else:
-            nfoinfo['event']['strEvent'] = str(season).zfill(2) + " : " + nfoinfo['event']['strEvent'] + " @ " + nfoinfo['event']['strVenue']
-        seasonname = nfoinfo['event']['strEvent']
-        kobimeta.makenfo(file, depth, nfoinfo, diskfile['nfo'], showname, episodename, episodenr, season)
-        
-    if (showname == '') or (episodename == '') or (episodenr == 0):
-        log.Log("No match found for {0}".format(file), pluginid, log.LL_WARN)
+            title = f"{season:02d} : {nfo_event['event']['strEvent']} @ {nfo_event['event']['strVenue']}"
+
+        seasonname = title
+        nfo_event['event']['strEvent'] = title
+
+        kobimeta.makenfo(
+            file,
+            depth,
+            nfo_event,
+            nfo_art,
+            showname,
+            episodename,
+            episodenr,
+            season
+        )
+
+    # Final validation & Jellyfin push
+    if not showname or not episodename or episodenr == 0:
+        log.Log(f"No usable match for {file}", pluginid, log.LL_WARN)
         return {'message': 'no match'}
-    else:
-        if 'kobimeta' in diskfile.keys():
-            if 'show' in diskfile['kobimeta'].keys():
-                backupshowname = diskfile['kobimeta']['show']
-            else:
-                backupshowname = ''
-        else:
-            backupshowname = ''
-        api.dump_to_jelly(showname, backupshowname, dirname, filename, diskfile['nfo'], episodenr, episodename, season, seasonname)
-        log.Log("Adding episode to list:", pluginid, log.LL_DEBUG)
-        log.Log("Series    : {0}".format(showname), pluginid, log.LL_DEBUG)
-        log.Log("Round/Week: {0}".format(season), pluginid, log.LL_DEBUG)
-        log.Log("Episode Nr: {0}".format(episodenr), pluginid, log.LL_DEBUG)
-        log.Log("Title     : {0}".format(episodename), pluginid, log.LL_DEBUG)
-        log.Log("Year      : {0}".format(year), pluginid, log.LL_DEBUG)
-        return {'showname': showname,
-                'season': season,
-                'episode': episodenr,
-                'eptitle': episodename,
-                'year': year}
-        
-    
+
+    backup_showname = diskfile['kobimeta'].get('show', '') if 'kobimeta' in diskfile else ''
+
+    # Push to Jellyfin
+    dirname = diskfile['entity']['path']
+    filename = diskfile['entity']['filename']
+
+    _jellyfin_client.dump_to_jelly(           # ← you'll need to implement or rename this method
+        showname,
+        backup_showname,
+        dirname,
+        filename,
+        diskfile.get('nfo', {}),
+        episodenr,
+        episodename,
+        season,
+        seasonname if 'seasonname' in locals() else episodename
+    )
+
+    log.Log("Episode added to Jellyfin queue:", pluginid, log.LL_DEBUG)
+    log.Log(f"  Series    : {showname}", pluginid, log.LL_DEBUG)
+    log.Log(f"  Round/Week: {season}", pluginid, log.LL_DEBUG)
+    log.Log(f"  Episode Nr: {episodenr}", pluginid, log.LL_DEBUG)
+    log.Log(f"  Title     : {episodenename}", pluginid, log.LL_DEBUG)
+    log.Log(f"  Year      : {year}", pluginid, log.LL_DEBUG)
+
+    return {
+        'showname': showname,
+        'season': season,
+        'episode': episodenr,
+        'eptitle': episodename,
+        'year': year
+    }
