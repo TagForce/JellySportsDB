@@ -63,7 +63,7 @@ class SportsFileHandler(FileSystemEventHandler):
 
 
 class JellyfinSportsMonitor:
-    """Main monitor class – fetches library paths from Jellyfin and starts watchers."""
+    """Main monitor class - fetches library paths from Jellyfin and starts watchers."""
 
     def __init__(self,
                  jellyfin_url: str = "http://192.168.2.20:8096/",
